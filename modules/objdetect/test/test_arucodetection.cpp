@@ -5,6 +5,16 @@
 #include "test_precomp.hpp"
 #include "opencv2/objdetect/aruco_detector.hpp"
 #include "opencv2/calib3d.hpp"
+#include "opencv2/core/utils/filesystem.hpp"
+
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <set>
+#include <sstream>
 
 namespace cv {
     namespace aruco {
@@ -689,8 +699,7 @@ struct ArucoThresholdTestConfig {
  * Loops over a set of detector configurations (validBitIdThreshold, distortion, DetectorParameters such as markerBorderBits)
  * For each configuration, it creates a synthetic image containing four markers arranged in a 2x2 grid.
  * Each marker is generated with its own configuration (id, size, rotation).
- * Make sure that markers are detected or not based on validBitIdThreshold and percentage of tempering.
- * Finally, it runs the detector and checks that each marker is detected or not based on the threshold.
+ * Finally, it runs the detector and checks that each marker is detected or not based on the threshold and percentage of tempering.
  *
  */
 static void runArucoDetectionThreshold(ArucoAlgParams arucoAlgParam) {
@@ -1125,6 +1134,333 @@ TEST(CV_ArucoDetectionThreshold, algorithmic) {
 
 TEST(CV_InvertedArucoDetectionThreshold, algorithmic) {
     runArucoDetectionThreshold(ArucoAlgParams::DETECT_INVERTED_MARKER);
+}
+
+struct ArucoFalsePositiveRunConfig {
+    std::vector<aruco::PredefinedDictionaryType> dictionaryTypes;
+    std::vector<float> validBitIdThresholds;
+    int maxImages;
+    std::string outputDir;
+};
+
+struct ArucoImageDetections {
+    int imageIndex = 0;
+    std::vector<int> ids;
+    std::vector<float> confidences;
+};
+
+struct ArucoFalsePositiveStats {
+    int totalImages = 0;
+    int imagesWithDetections = 0;
+    int imagesWithMultipleDetections = 0;
+    int totalDetections = 0;
+    int maxDetectionsPerImage = 0;
+    double totalConfidenceSum = 0.0;
+    float totalConfidenceMax = 0.0f;
+    std::map<int, int> detectionsById;
+    std::map<int, int> imagesById;
+    std::map<int, double> confidenceSumById;
+    std::map<int, float> confidenceMaxById;
+    std::vector<ArucoImageDetections> images;
+};
+
+static std::string dictionaryTypeName(aruco::PredefinedDictionaryType type) {
+    switch (type) {
+        case aruco::DICT_4X4_1000:
+            return "DICT_4X4_1000";
+        case aruco::DICT_5X5_1000:
+            return "DICT_5X5_1000";
+        case aruco::DICT_6X6_1000:
+            return "DICT_6X6_1000";
+        case aruco::DICT_7X7_1000:
+            return "DICT_7X7_1000";
+        default:
+            return cv::format("DICT_%d", static_cast<int>(type));
+    }
+}
+
+static ArucoFalsePositiveRunConfig getFalsePositiveRunConfig() {
+    ArucoFalsePositiveRunConfig config;
+    config.dictionaryTypes = {
+        aruco::DICT_4X4_1000,
+        aruco::DICT_5X5_1000,
+        aruco::DICT_6X6_1000,
+        aruco::DICT_7X7_1000
+    };
+    config.validBitIdThresholds = {
+        0.10f, 0.20f, 0.30f, 0.40f, 0.43f, 0.46f, 0.49f, 0.50f, 0.53f, 0.56f, 0.60f, 0.70f, 0.80f, 0.90f
+    };
+    config.maxImages = 10;
+    config.outputDir = "aruco_false_positive_results";
+    return config;
+}
+
+static void addDetections(ArucoFalsePositiveStats& stats,
+                          int imageIndex,
+                          const std::vector<int>& ids,
+                          const std::vector<float>& confidences) {
+    CV_Assert(ids.size() == confidences.size());
+    stats.totalImages++;
+    const int detectionCount = static_cast<int>(ids.size());
+    if (detectionCount > 0) {
+        stats.imagesWithDetections++;
+        if (detectionCount > 1) {
+            stats.imagesWithMultipleDetections++;
+        }
+        stats.maxDetectionsPerImage = std::max(stats.maxDetectionsPerImage, detectionCount);
+        ArucoImageDetections entry;
+        entry.imageIndex = imageIndex;
+        entry.ids = ids;
+        entry.confidences = confidences;
+        stats.images.push_back(entry);
+    }
+    stats.totalDetections += detectionCount;
+    std::set<int> uniqueIds;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const int id = ids[i];
+        const float confidence = confidences[i];
+        stats.detectionsById[id] += 1;
+        stats.confidenceSumById[id] += confidence;
+        stats.confidenceMaxById[id] = std::max(stats.confidenceMaxById[id], confidence);
+        stats.totalConfidenceSum += confidence;
+        stats.totalConfidenceMax = std::max(stats.totalConfidenceMax, confidence);
+        uniqueIds.insert(id);
+    }
+    for (int id : uniqueIds) {
+        stats.imagesById[id] += 1;
+    }
+}
+
+static double safeDivide(double numerator, double denominator) {
+    return denominator > 0.0 ? numerator / denominator : 0.0;
+}
+
+static std::string joinInts(const std::vector<int>& values) {
+    std::ostringstream oss;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) {
+            oss << ';';
+        }
+        oss << values[i];
+    }
+    return oss.str();
+}
+
+static std::string joinFloats(const std::vector<float>& values, int precision) {
+    std::ostringstream oss;
+    oss.setf(std::ios::fixed);
+    oss << std::setprecision(precision);
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) {
+            oss << ';';
+        }
+        oss << values[i];
+    }
+    return oss.str();
+}
+
+static std::string findArucoFalsePositiveScript() {
+    const std::vector<std::string> candidates = {
+        "modules/objdetect/test/aruco_false_positive_analysis.py",
+        "opencv/modules/objdetect/test/aruco_false_positive_analysis.py",
+        "../opencv/modules/objdetect/test/aruco_false_positive_analysis.py"
+    };
+    for (const auto& candidate : candidates) {
+        if (cv::utils::fs::exists(candidate)) {
+            return candidate;
+        }
+    }
+    return std::string();
+}
+
+static void tryGenerateFalsePositivePlots(const std::string& outputDir) {
+    const std::string scriptPath = findArucoFalsePositiveScript();
+    if (scriptPath.empty()) {
+        std::cout << "Plot generation skipped: analysis script not found." << std::endl;
+        return;
+    }
+    const std::string summaryPath = cv::utils::fs::join(outputDir, "summary.csv");
+    if (!cv::utils::fs::exists(summaryPath)) {
+        std::cout << "Plot generation skipped: missing " << summaryPath << std::endl;
+        return;
+    }
+    const std::string command = cv::format(
+        "python3 \"%s\" --summary \"%s\" --output-dir \"%s\"",
+        scriptPath.c_str(),
+        summaryPath.c_str(),
+        outputDir.c_str());
+    const int result = std::system(command.c_str());
+    if (result != 0) {
+        std::cout << "Plot generation skipped: command failed (" << result << ")." << std::endl;
+    }
+}
+
+// Outputs summary.csv, per_image.csv, and per_id.csv into config.outputDir.
+static bool runArucoFalsePositiveSweep(const ArucoFalsePositiveRunConfig& config) {
+    CV_Assert(config.maxImages > 0);
+    CV_Assert(!config.dictionaryTypes.empty());
+    CV_Assert(!config.validBitIdThresholds.empty());
+
+    const std::string firstImagePath = cvtest::findDataFile("aruco/archive/mirflickr/im1.jpg", false);
+    if (firstImagePath.empty()) {
+        std::cout << "Missing dataset: aruco/archive/mirflickr" << std::endl;
+        return false;
+    }
+
+    const std::string datasetDir = cv::utils::fs::getParent(firstImagePath);
+    if (!cv::utils::fs::exists(config.outputDir)) {
+        if (!cv::utils::fs::createDirectories(config.outputDir)) {
+            std::cout << "Failed to create output dir: " << config.outputDir << std::endl;
+            return false;
+        }
+    }
+
+    const std::string summaryPath = cv::utils::fs::join(config.outputDir, "summary.csv");
+    const std::string perImagePath = cv::utils::fs::join(config.outputDir, "per_image.csv");
+    const std::string perIdPath = cv::utils::fs::join(config.outputDir, "per_id.csv");
+
+    std::ofstream summaryCsv(summaryPath.c_str());
+    std::ofstream perImageCsv(perImagePath.c_str());
+    std::ofstream perIdCsv(perIdPath.c_str());
+    if (!summaryCsv.is_open() || !perImageCsv.is_open() || !perIdCsv.is_open()) {
+        std::cout << "Failed to open output files in: " << config.outputDir << std::endl;
+        return false;
+    }
+
+    summaryCsv
+        << "dictionary,valid_bit_id_threshold,max_images,total_images,total_detections,"
+        << "images_with_detections,images_with_multiple_detections,unique_ids,"
+        << "mean_detections_per_image,mean_detections_per_positive_image,"
+        << "image_detection_rate,max_detections_in_image,mean_confidence,max_confidence\n";
+
+    perImageCsv
+        << "dictionary,valid_bit_id_threshold,image_index,detected_count,"
+        << "mean_confidence,max_confidence,image_path,ids,confidences\n";
+
+    perIdCsv
+        << "dictionary,valid_bit_id_threshold,id,detection_count,images_with_id,"
+        << "images_with_id_rate,mean_confidence,max_confidence\n";
+
+    for (size_t dictIdx = 0; dictIdx < config.dictionaryTypes.size(); ++dictIdx) {
+        const aruco::PredefinedDictionaryType dictType = config.dictionaryTypes[dictIdx];
+        const std::string dictName = dictionaryTypeName(dictType);
+        const aruco::Dictionary dictionary = aruco::getPredefinedDictionary(dictType);
+
+        for (size_t thrIdx = 0; thrIdx < config.validBitIdThresholds.size(); ++thrIdx) {
+            const float threshold = config.validBitIdThresholds[thrIdx];
+            aruco::DetectorParameters params;
+            params.validBitIdThreshold = threshold;
+
+            aruco::ArucoDetector detector(dictionary, params);
+            ArucoFalsePositiveStats stats;
+
+            for (int imageIndex = 1; imageIndex <= config.maxImages; ++imageIndex) {
+                const std::string imageName = cv::format("im%d.jpg", imageIndex);
+                const std::string imagePath = cv::utils::fs::join(datasetDir, imageName);
+                Mat image = imread(imagePath, IMREAD_GRAYSCALE);
+                if (image.empty()) {
+                    std::cout << "Failed to read image: " << imagePath << std::endl;
+                    return false;
+                }
+
+                std::vector<std::vector<Point2f>> corners;
+                std::vector<std::vector<Point2f>> rejected;
+                std::vector<int> ids;
+                std::vector<float> markerConfidence;
+                detector.detectMarkersWithConfidence(image, corners, ids, markerConfidence, rejected);
+                addDetections(stats, imageIndex, ids, markerConfidence);
+            }
+
+            const double meanDetectionsPerImage =
+                safeDivide(static_cast<double>(stats.totalDetections), stats.totalImages);
+            const double meanDetectionsPerPositiveImage =
+                safeDivide(static_cast<double>(stats.totalDetections), stats.imagesWithDetections);
+            const double imageDetectionRate =
+                safeDivide(static_cast<double>(stats.imagesWithDetections), stats.totalImages);
+            const double meanConfidence =
+                safeDivide(stats.totalConfidenceSum, stats.totalDetections);
+
+            summaryCsv << dictName << ","
+                       << std::fixed << std::setprecision(3) << threshold << ","
+                       << config.maxImages << ","
+                       << stats.totalImages << ","
+                       << stats.totalDetections << ","
+                       << stats.imagesWithDetections << ","
+                       << stats.imagesWithMultipleDetections << ","
+                       << stats.detectionsById.size() << ","
+                       << std::setprecision(6) << meanDetectionsPerImage << ","
+                       << meanDetectionsPerPositiveImage << ","
+                       << imageDetectionRate << ","
+                       << stats.maxDetectionsPerImage << ","
+                       << meanConfidence << ","
+                       << stats.totalConfidenceMax << "\n";
+
+            for (const auto& entry : stats.images) {
+                const int imageIndex = entry.imageIndex;
+                const std::vector<int>& ids = entry.ids;
+                const std::vector<float>& confidences = entry.confidences;
+                const double meanImageConfidence =
+                    safeDivide(std::accumulate(confidences.begin(), confidences.end(), 0.0),
+                               static_cast<double>(confidences.size()));
+                const float maxImageConfidence =
+                    *std::max_element(confidences.begin(), confidences.end());
+                const std::string imageName = cv::format("im%d.jpg", imageIndex);
+                perImageCsv << dictName << ","
+                            << std::fixed << std::setprecision(3) << threshold << ","
+                            << imageIndex << ","
+                            << ids.size() << ","
+                            << std::setprecision(6) << meanImageConfidence << ","
+                            << maxImageConfidence << ","
+                            << imageName << ","
+                            << joinInts(ids) << ","
+                            << joinFloats(confidences, 4) << "\n";
+            }
+
+            for (const auto& entry : stats.detectionsById) {
+                const int id = entry.first;
+                const int detectionCount = entry.second;
+                const int imagesWithId = stats.imagesById[id];
+                const double imagesWithIdRate =
+                    safeDivide(static_cast<double>(imagesWithId), stats.totalImages);
+                const double meanIdConfidence =
+                    safeDivide(stats.confidenceSumById[id], detectionCount);
+                const float maxIdConfidence = stats.confidenceMaxById[id];
+                perIdCsv << dictName << ","
+                         << std::fixed << std::setprecision(3) << threshold << ","
+                         << id << ","
+                         << detectionCount << ","
+                         << imagesWithId << ","
+                         << std::setprecision(6) << imagesWithIdRate << ","
+                         << meanIdConfidence << ","
+                         << maxIdConfidence << "\n";
+            }
+
+            std::cout << "Aruco false positives: " << dictName
+                      << " threshold=" << std::fixed << std::setprecision(3) << threshold
+                      << " detections=" << stats.totalDetections
+                      << " images_with_fp=" << stats.imagesWithDetections
+                      << "/" << stats.totalImages << std::endl;
+        }
+    }
+
+    summaryCsv.close();
+    perImageCsv.close();
+    perIdCsv.close();
+
+    std::cout << "False positive results saved to: " << config.outputDir << std::endl;
+    std::cout << "Summary: " << summaryPath << std::endl;
+    std::cout << "Per-image: " << perImagePath << std::endl;
+    std::cout << "Per-id: " << perIdPath << std::endl;
+    tryGenerateFalsePositivePlots(config.outputDir);
+    return true;
+}
+
+
+TEST(CV_ArucoDetectFalsePositives, algorithmic)
+{
+    ArucoFalsePositiveRunConfig config = getFalsePositiveRunConfig();
+
+    ASSERT_TRUE(runArucoFalsePositiveSweep(config));
 }
 
 TEST(CV_ArucoDetectMarkers, regression_3192)
